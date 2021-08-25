@@ -1,0 +1,238 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - develop
+      - main
+      
+jobs:
+  upgrade_version_number:
+    name: Upgrade Version Number
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+          
+      - name: Upgrade Version Number
+        run: |
+          # Get the last commit message.
+          message=$(git log --format=%B -n 1)
+          
+          if [[ $message == *"#major"* || $message == *"#minor"* || $message == *"#patch"* ]]
+          then
+            major="0"
+            minor="0"
+            patch="0"
+            
+            if [[ $(git describe --tags $(git rev-list --tags --max-count=1)) =~ v([0-9]+).([0-9]+).([0-9]+) ]]
+            then
+              [[ $(git describe --tags $(git rev-list --tags --max-count=1)) =~ v([0-9]+).([0-9]+).([0-9]+) ]]
+              major=${BASH_REMATCH[1]}
+              minor=${BASH_REMATCH[2]}
+              patch=${BASH_REMATCH[3]}
+              
+              if [[ "$message" == *"#major"* ]]
+              then
+                major=$((major+1))
+                minor="0"
+                patch="0"
+              elif [[ "$message" == *"#minor"* ]]
+              then
+                minor=$((minor+1))
+                patch="0"
+              elif [[ "$message" == *"#patch"* ]]
+              then
+                patch=$(echo $(git log --format=%B) | grep -o -i "#patch" | wc -l)
+              fi
+            else
+              if [[ "$message" == *"#major"* ]]
+              then
+                major="1"
+              elif [[ "$message" == *"#minor"* ]]
+              then
+                minor="1"
+              elif [[ "$message" == *"#patch"* ]]
+              then
+                patch="1"
+              fi
+            fi
+            
+            latest_version=$major.$minor.$patch
+            
+            git config --global user.name "Faragó Gergely"
+            git config --global user.email "38722302+iftg7n@users.noreply.github.com"
+            git tag v$latest_version
+
+            # First, depends of the command, push the new version tag to remote.
+            # Then, if the major or minor part of the version number upgraded, it search and closes the proper issue.
+            if [[ "$message" == *"#major"* || "$message" == *"#minor"* ]]
+            then
+              git push -u --tags origin develop
+
+              gh auth login --with-token < <(echo ${{ secrets.GITHUB_TOKEN }})
+              
+              [[ "$message" =~ .*#([0-9]+).* ]]
+              gh issue close ${BASH_REMATCH[1]}
+            else
+              git push -u --tags origin main
+            fi
+          else
+            echo "No version upgrade required."
+          fi
+        continue-on-error: true
+          
+  update_develop_main_branch:
+    name: Update Develop/Main Branch
+    needs: upgrade_version_number
+    if: contains(github.event.commits[0].message, '#release')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+          
+      - name: Update Develop/Main Branch
+        run: |
+          latest_version=$(git describe --tags $(git rev-list --tags --max-count=1))
+          latest_version=${latest_version:1}
+          message=$(git log --format=%B -n 1)
+          release=$(git rev-parse HEAD)
+          
+          git config --global user.name "Faragó Gergely"
+          git config --global user.email "38722302+iftg7n@users.noreply.github.com"
+          
+          if [[ "$message" == *"#patch"* ]]
+          then
+            git commit --amend -m "Release v$latest_version."
+            git push --force
+            git checkout develop
+            git cherry-pick -n $release
+            git commit -m "$message"
+            git push origin :refs/tags/v$latest_version
+            git tag -af v$latest_version -m "$message"
+            git push -u --tags origin develop
+          else
+            number=$(git log --oneline | grep -n 'Initial commit.' | cut -d: -f 1)
+            release_number=$(git log --oneline | grep -n 'release' | sed -n 2p | cut -d: -f 1)
+
+            if [[ $release_number != "" && $release_number -lt $number ]]
+            then
+              number=$release_number
+              
+              hotfix_number=$(git log --oneline | grep -n 'hotfix' | cut -d: -f 1)
+              if [[ $hotfix_number != "" && $hotfix_number -lt $number ]]
+              then
+                number=$hotfix_number
+              fi
+            fi
+
+            number=$((number-1))
+            features_release=$(git log --oneline -n $number | sed '1!G;h;$!d' | sed 's/\([a-z0-9]\{7\}\) .*/\1 /g')
+
+            git checkout main
+            git cherry-pick -n $features_release
+            git commit -m "Release v$latest_version."
+            git push -u origin main
+          fi
+          
+  create_release:
+    name: Create Release
+    needs: update_develop_main_branch
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+          ref: develop
+          
+      - name: Get Latest Version Tag
+        run: |
+          latest_version=$(git describe --tags $(git rev-list --tags --max-count=1))
+          echo "VERSION=${latest_version:1}" >> $GITHUB_ENV
+          
+      - name: Create Changelog
+        run: |
+          message=$(git log --format=%B -n 2)
+          latest_version=${{ env.VERSION }}
+          
+          gh auth login --with-token < <(echo ${{ secrets.GITHUB_TOKEN }})
+
+          if [[ $message =~ ("#major: ")(.*) || $message =~ ("#minor: ")(.*) ]]
+          then
+            number=$(git log --oneline | grep -n 'Initial commit.' | cut -d: -f 1)
+            release_number=$(git log --oneline | grep -n 'release' | sed -n 2p | cut -d: -f 1)
+
+            if [[ $release_number != "" && $release_number -lt $number ]]
+            then
+              number=$release_number
+              
+              hotfix_number=$(git log --oneline | grep -n 'hotfix' | cut -d: -f 1)
+              if [[ $hotfix_number != "" && $hotfix_number -lt $number ]]
+              then
+                number=$hotfix_number
+              fi
+            fi
+
+            number=$((number-1))
+            features=$(git log --format=%B -n $number)
+            features=$(echo "${features}" | sed '/#major\|#minor/!d')
+            features=$(echo "${features}" | sed 's/\(* \)\(#major: \|#minor#\)\([0-9]+\)/- ### (\3)/g')
+            # TODO: Exchange the numbers with the proper issues title.
+            features=$(echo "${features}" | sed '1!G;h;$!d')
+            echo -en "## Features:\n\n""${features}""\n\n" > changelog.txt
+
+            issues=$(gh issue list -s all -l "bug" -m v$latest_version)
+            issues=$(echo ${issues} | sed 's/ bug [2-9][0-9][0-9][0-9]\-[0-1][0-9]\-[0-3][0-9] [0-1][0-9]\:[0-6][0-9]\:[0-6][0-9] +0000 UTC /\n/g')
+            issues=$(echo "${issues}" | sed '/[0-9]\+ OPEN/d')
+
+            if [[ ${#issues} -ne 0 ]]
+            then
+              issues=$(echo "${issues}" | sed 's/ bug [2-9][0-9][0-9][0-9]\-[0-1][0-9]\-[0-3][0-9] [0-1][0-9]\:[0-6][0-9]\:[0-6][0-9] +0000 UTC//g')
+              issues=$(echo "${issues}" | sed 's/\([0-9]\+\) CLOSED/- ### (#\1) /g')
+              echo -en "## Fixed Issues:\n\n""${issues}" >> changelog.txt
+            fi
+          else
+            [[ $latest_version =~ ([0-9]+).([0-9]+).([0-9]+) ]]
+            major=${BASH_REMATCH[1]}
+            minor=${BASH_REMATCH[2]}
+            latest_version=$major"."$minor".0"
+            
+            issues=$(gh issue list -s all -l "hotfix" -m v$latest_version)
+            issues=$(echo ${issues} | sed 's/ hotfix [2-9][0-9][0-9][0-9]\-[0-1][0-9]\-[0-3][0-9] [0-1][0-9]\:[0-6][0-9]\:[0-6][0-9] +0000 UTC /\n/g')
+            issues=$(echo "${issues}" | sed '/[0-9]\+ OPEN/d')
+
+            if [[ ${#issues} -ne 0 ]]
+            then
+              issues=$(echo "${issues}" | sed 's/ hotfix [2-9][0-9][0-9][0-9]\-[0-1][0-9]\-[0-3][0-9] [0-1][0-9]\:[0-6][0-9]\:[0-6][0-9] +0000 UTC//g')
+              issues=$(echo "${issues}" | sed 's/\([0-9]\+\) CLOSED/- ### (#\1) /g')
+              echo -en "## Hotfixes:\n\n""${issues}" > changelog.txt
+            fi
+          fi
+          
+          if [[ -f "changelog.txt" ]]
+          then
+            echo "Changelog file created successfully."
+          else
+            echo "Changelog file not exists. Please, create a changelog!"
+            echo "Please, create a changelog!" > changelog.txt
+          fi
+          
+      - name: Create Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: v${{ env.VERSION }}
+          release_name: Release v${{ env.VERSION }}
+          body_path: changelog.txt
+          
+      - name: Remove Changelog
+        run: |
+          rm changelog.txt
+          echo "Changelog file removed successfully."
